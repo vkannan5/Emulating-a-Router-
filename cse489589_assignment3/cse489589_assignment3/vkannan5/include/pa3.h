@@ -1,0 +1,1050 @@
+#include <iostream>
+#include <string.h>
+#include <unistd.h>
+#include <sys/types.h> 
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <string.h>
+#include <netdb.h>
+#include <strings.h>
+#include <stdlib.h>
+#include <sys/socket.h>
+#include <sys/queue.h>
+#include <inttypes.h>
+#include <vector> 
+#include <fstream> 
+#include <sys/stat.h>
+using namespace std;
+
+#ifndef PACKET_USING_STRUCT
+    #define CNTRL_CONTROL_CODE_OFFSET 0x04
+    #define CNTRL_PAYLOAD_LEN_OFFSET 0x06
+#endif
+
+#ifndef PACKET_USING_STRUCT
+    #define CNTRL_RESP_CONTROL_CODE_OFFSET 0x04
+    #define CNTRL_RESP_RESPONSE_CODE_OFFSET 0x05
+    #define CNTRL_RESP_PAYLOAD_LEN_OFFSET 0x06
+#endif
+
+#define TRUE 1
+#define FALSE 0
+#define AUTHOR_STATEMENT "I, vkannan5, have read and understood the course academic integrity policy."
+#define INIT_STATEMENT ""
+#define INFINITY 65535;
+
+/************************************************************************************************************************************/
+uint16_t Number_of_routers, Periodic_Interval;
+uint16_t Routing_Table[6][6], Distance_Vector[6][6];
+uint32_t Router_IP[6];
+char IP[6][1024];
+char buffer[10][INET_ADDRSTRLEN + 1], buffer2[INET_ADDRSTRLEN + 1];
+int My_ID, sock_tcp=-1, fdaccept2;
+struct sockaddr_in control_addr;
+socklen_t addrlen = sizeof(control_addr);
+std::vector<int> Neighbors;
+char* routing_update_payload;
+uint16_t nexthop[6][1], Initial_Cost[6];
+char file_name[256];
+char TCP_payload[1036], send_buffer[1036];
+bool recv_more=true;  
+char last_packet_sent[1036];
+char penultimate_packet[1036]; 
+int sent=0; 
+
+/******* Routing Table - ID, Port1, Port2, Cost, NextHop ********/
+/******* Distance Vector - Cost **********/
+void received_TCP();
+
+struct ControlConn
+{
+    int sockfd;
+    LIST_ENTRY(ControlConn) next;
+}*connection, *conn_temp;
+LIST_HEAD(ControlConnsHead, ControlConn) control_conn_list;
+
+fd_set master_list, watch_list;
+int head_fd;
+
+
+
+/*******REFERENCE: https://stackoverflow.com/questions/2409504/using-c-filestreams-fstream-how-can-you-determine-the-size-of-a-file**********/
+int fileSize( const char* filePath ){
+
+    std::streampos fsize = 0;
+    std::ifstream file( filePath, std::ios::binary );
+
+    fsize = file.tellg();
+    file.seekg( 0, std::ios::end );
+    fsize = file.tellg() - fsize;
+    file.close();
+   // cout<<"Size is:"<<fsize<<endl;
+   // printf("Filesize is %d\n", (int)fsize);
+    return (int)fsize;
+}
+
+
+char* create_response_header(int sock_index, uint8_t control_code, uint8_t response_code, uint16_t payload_len)
+{
+    char *buffer;
+    #ifdef PACKET_USING_STRUCT
+        /** ASSERT(sizeof(struct CONTROL_RESPONSE_HEADER) == 8) 
+          * This is not really necessary with the __packed__ directive supplied during declaration (see control_header_lib.h).
+          * If this fails, comment #define PACKET_USING_STRUCT in control_header_lib.h
+          */
+        BUILD_BUG_ON(sizeof(struct CONTROL_RESPONSE_HEADER) != CNTRL_RESP_HEADER_SIZE); /* This will FAIL during compilation itself; See comment above.*/
+
+        struct CONTROL_RESPONSE_HEADER *cntrl_resp_header;
+    #endif
+    #ifndef PACKET_USING_STRUCT
+        char *cntrl_resp_header;
+    #endif
+
+    struct sockaddr_in addr;
+    socklen_t addr_size;
+
+    buffer = (char *) malloc(sizeof(char)*CNTRL_RESP_HEADER_SIZE);
+    #ifdef PACKET_USING_STRUCT
+        cntrl_resp_header = (struct CONTROL_RESPONSE_HEADER *) buffer;
+    #endif
+    #ifndef PACKET_USING_STRUCT
+        cntrl_resp_header = buffer;
+    #endif
+
+    addr_size = sizeof(struct sockaddr_in);
+    getpeername(sock_index, (struct sockaddr *)&addr, &addr_size);
+
+    #ifdef PACKET_USING_STRUCT
+        /* Controller IP Address */
+        memcpy(&(cntrl_resp_header->controller_ip_addr), &(addr.sin_addr), sizeof(struct in_addr));
+        /* Control Code */
+        cntrl_resp_header->control_code = control_code;
+        /* Response Code */
+        cntrl_resp_header->response_code = response_code;
+        /* Payload Length */
+        cntrl_resp_header->payload_len = htons(payload_len);
+    #endif
+
+    #ifndef PACKET_USING_STRUCT
+        /* Controller IP Address */
+        memcpy(cntrl_resp_header, &(addr.sin_addr), sizeof(struct in_addr));
+        /* Control Code */
+        memcpy(cntrl_resp_header+CNTRL_RESP_CONTROL_CODE_OFFSET, &control_code, sizeof(control_code));
+        /* Response Code */
+        memcpy(cntrl_resp_header+CNTRL_RESP_RESPONSE_CODE_OFFSET, &response_code, sizeof(response_code));
+        /* Payload Length */
+        payload_len = htons(payload_len);
+        memcpy(cntrl_resp_header+CNTRL_RESP_PAYLOAD_LEN_OFFSET, &payload_len, sizeof(payload_len));
+    #endif
+
+    return buffer;
+}
+
+ssize_t recvALL(int sock_index, char *buffer, ssize_t nbytes)
+{       int i;
+    ssize_t bytes = 0;
+    bytes = recv(sock_index, buffer, nbytes, 0);
+        //printf("HERE 4\n");
+    if(bytes == 0) return -1;
+    while(bytes != nbytes)
+        bytes += recv(sock_index, buffer+bytes, nbytes-bytes, 0);
+    return bytes;
+}
+
+ssize_t sendALL(int sock_index, char *buffer, ssize_t nbytes)
+{
+    ssize_t bytes = 0;
+    bytes = send(sock_index, buffer, nbytes, 0);
+
+    if(bytes == 0) return -1;
+    while(bytes != nbytes)
+        bytes += send(sock_index, buffer+bytes, nbytes-bytes, 0);
+
+    return bytes;
+}
+
+uint16_t convert(uint8_t num1, uint8_t num2) {
+    uint16_t combined = 0x0000;
+
+    combined = num1;
+    combined = combined << 8;
+    combined |= num2;
+    return combined;
+}
+
+void dijkstra(int rid)
+{
+  int i,j;
+  //printf("The distance vector at the start is \n");
+
+    for(i=1;i<Number_of_routers+1;i++)
+    {
+      for(j=1;j<Number_of_routers+1;j++)
+      {
+        //cout<<Distance_Vector[i][j]<<" ";
+      }//cout<<endl;
+    }
+
+    for(i=1;i<Number_of_routers+1;i++)
+    {
+      //cout<<Routing_Table[i][3]<<" ";
+        //cout<<endl;
+    }
+
+  for(i=1;i<Number_of_routers+1;i++)
+  {
+    if(Routing_Table[i][3]>(Distance_Vector[rid][i] + Routing_Table[rid][3]))
+    {
+      Routing_Table[i][3]= Distance_Vector[rid][i] + Routing_Table[rid][3];
+      Routing_Table[i][4]=rid;
+    }
+  }
+/*
+  printf("The distance vector at the end is \n");
+  printf("%d ",My_ID);
+
+    for(i=1;i<Number_of_routers+1;i++)
+    {
+      cout<<Routing_Table[i][3]<<" ";
+      //cout<<endl;
+    } */
+}
+
+void author_response(int sock_index)
+{   uint16_t payload_len, response_len;
+    char *cntrl_response_header, *cntrl_response_payload, *cntrl_response;
+
+    payload_len = sizeof(AUTHOR_STATEMENT)-1; // Discount the NULL chararcter
+    cntrl_response_payload = (char *) malloc(payload_len);
+    memcpy(cntrl_response_payload, AUTHOR_STATEMENT, payload_len);
+
+    cntrl_response_header = create_response_header(sock_index, 0, 0, payload_len);
+
+    response_len = CNTRL_RESP_HEADER_SIZE+payload_len;
+    cntrl_response = (char *) malloc(response_len);
+    /* Copy Header */
+    memcpy(cntrl_response, cntrl_response_header, CNTRL_RESP_HEADER_SIZE);
+    free(cntrl_response_header);
+    /* Copy Payload */
+    memcpy(cntrl_response+CNTRL_RESP_HEADER_SIZE, cntrl_response_payload, payload_len);
+    free(cntrl_response_payload);
+
+    sendALL(sock_index, cntrl_response, response_len);
+
+    free(cntrl_response);
+}
+
+int create_control_sock()
+{
+    int sock;
+    struct sockaddr_in control_addr;
+    socklen_t addrlen = sizeof(control_addr);
+
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if(sock < 0)
+        ERROR("socket() failed");
+
+    /* Make socket re-usable */
+    if(setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (int[]){1}, sizeof(int)) < 0)
+        ERROR("setsockopt() failed");
+
+    bzero(&control_addr, sizeof(control_addr));
+
+    control_addr.sin_family = AF_INET;
+    control_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    control_addr.sin_port = htons(CONTROL_PORT);
+
+    if(bind(sock, (struct sockaddr *)&control_addr, sizeof(control_addr)) < 0)
+        ERROR("bind() failed");
+
+    if(listen(sock, 5) < 0)
+        ERROR("listen() failed");
+
+    LIST_INIT(&control_conn_list);
+
+    return sock;
+}
+
+int create_data_sock()
+{
+    int sock;
+    struct sockaddr_in control_addr;
+    socklen_t addrlen = sizeof(control_addr);
+
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if(sock < 0)
+        ERROR("socket() failed");
+
+    /* Make socket re-usable */
+    if(setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (int[]){1}, sizeof(int)) < 0)
+        ERROR("setsockopt() failed");
+
+    bzero(&control_addr, sizeof(control_addr));
+
+    control_addr.sin_family = AF_INET;
+    control_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    control_addr.sin_port = htons(DATA_PORT);
+
+    if(bind(sock, (struct sockaddr *)&control_addr, sizeof(control_addr)) < 0)
+        ERROR("bind() failed");
+
+    if(listen(sock, 5) < 0)
+        ERROR("listen() failed");
+
+    LIST_INIT(&control_conn_list);
+    data_socket = sock;
+}
+
+int new_control_conn(int sock_index)
+{
+    int fdaccept;
+    socklen_t caddr_len;
+    struct sockaddr_in remote_controller_addr;
+
+    caddr_len = sizeof(remote_controller_addr);
+    fdaccept = accept(sock_index, (struct sockaddr *)&remote_controller_addr, &caddr_len);
+    if(fdaccept < 0)
+        ERROR("accept() failed");
+
+    /* Insert into list of active control connections */
+    connection = (struct ControlConn*) malloc(sizeof(struct ControlConn));
+    connection->sockfd = fdaccept;
+    LIST_INSERT_HEAD(&control_conn_list, connection, next);
+
+    return fdaccept;
+}
+
+int new_TCP_conn(int sock_index)
+{ //printf("Creating new TCP conn\n");
+  int fdaccept;
+  
+    socklen_t caddr_len;
+    struct sockaddr_in remote_controller_addr;
+
+    caddr_len = sizeof(remote_controller_addr);
+    fdaccept = accept(sock_index, (struct sockaddr *)&remote_controller_addr, &caddr_len);
+    if(fdaccept < 0)
+        ERROR("accept() failed");
+    return fdaccept;
+}
+/*
+void TCP_DATA_FWD(int fdaccept)
+{ printf("TCP_DATA_FWD called\n");
+  recv(fdaccept, TCP_payload, 1036,0);
+  memcpy(buffer_TCP,TCP_payload,sizeof(TCP_payload));
+  //buffer_TCP[1036]='\0';
+
+  printf("I Received %s\n", buffer_TCP);
+  int i;
+   for(i=0;i<1036;i++)
+    {
+        printf("%c",TCP_payload[i]);
+    }
+  //printf("%d\n",sizeof(buffer_TCP));
+  received_TCP();
+}
+*/
+void remove_control_conn(int sock_index)
+{
+    LIST_FOREACH(connection, &control_conn_list, next) {
+        if(connection->sockfd == sock_index) LIST_REMOVE(connection, next); // this may be unsafe?
+        free(connection);
+    }
+
+    close(sock_index);
+}
+
+bool isControl(int sock_index)
+{
+    LIST_FOREACH(connection, &control_conn_list, next)
+        if(connection->sockfd == sock_index) return TRUE;
+
+    return FALSE;
+}
+
+int create_router_sock()
+{
+    int sock;
+    
+    sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if(sock < 0)
+        ERROR("socket() failed");
+
+    /* Make socket re-usable */
+    if(setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (int[]){1}, sizeof(int)) < 0)
+        ERROR("setsockopt() failed");
+
+    control_addr.sin_family = AF_INET;
+    control_addr.sin_addr.s_addr = htonl(INADDR_ANY); 
+    control_addr.sin_port = htons(ROUTER_PORT); 
+
+    if(bind(sock, (struct sockaddr *)&control_addr, sizeof(struct sockaddr)) < 0)
+        ERROR("bind() failed");
+
+    router_socket=sock;
+}
+
+void init_response(int sock_index)
+{ //printf("Init response called\n");
+  uint16_t payload_len, response_len;
+  char *cntrl_response_header, *cntrl_response_payload, *cntrl_response;
+
+  payload_len = sizeof(INIT_STATEMENT)-1; // Discount the NULL chararcter
+  cntrl_response_payload = (char *) malloc(payload_len);
+  memcpy(cntrl_response_payload, INIT_STATEMENT, payload_len);
+
+  cntrl_response_header = create_response_header(sock_index, 0, 0, payload_len);
+
+  response_len = CNTRL_RESP_HEADER_SIZE+payload_len;
+  cntrl_response = (char *) malloc(response_len);
+  /* Copy Header */
+  memcpy(cntrl_response, cntrl_response_header, CNTRL_RESP_HEADER_SIZE);
+  free(cntrl_response_header);
+  /* Copy Payload */
+  memcpy(cntrl_response+CNTRL_RESP_HEADER_SIZE, cntrl_response_payload, payload_len);
+  free(cntrl_response_payload);
+
+  sendALL(sock_index, cntrl_response, response_len);
+
+  free(cntrl_response);
+}
+
+void init_control_response(int sock_index)
+{ uint16_t payload_len, response_len;
+  char *cntrl_response_header;
+  char *cntrl_response_payload;//[40];
+  char *cntrl_response;
+  int i,j;
+  cntrl_response_payload=(char *)malloc(sizeof(uint16_t)*20);
+  int count=0;
+  
+  for(i=1;i<Number_of_routers+1;i++)
+  {    
+    //cout<<"Routing_Table[i][0]: "<<Routing_Table[i][0];
+    uint16_t r_id_n=htons(Routing_Table[i][0]);
+    memcpy(&cntrl_response_payload[2*count], &r_id_n, 2);
+    count++;
+
+    //cout<<"Padding: ";
+    uint16_t temp2=0;
+    uint16_t temp3=htons(temp2);
+    memcpy(&cntrl_response_payload[2*count], &temp3, 2);
+    count++;
+
+   // cout<<"Routing_Table[i][4]: "<<Routing_Table[i][4];
+    temp3=htons(Routing_Table[i][4]);
+    memcpy(&cntrl_response_payload[2*count], &temp3, 2);
+    count++;
+
+   // cout<<"Routing_Table[i][3]: "<<Routing_Table[i][3];
+    temp3=htons(Routing_Table[i][3]);
+    memcpy(&cntrl_response_payload[2*count], &temp3, 2);
+    count++;
+  } //cout<<endl;
+
+  payload_len=8*Number_of_routers;
+  cntrl_response_header = create_response_header(sock_index, 0, 0, payload_len);
+  response_len = CNTRL_RESP_HEADER_SIZE+payload_len;
+  cntrl_response = (char *) malloc(response_len);  
+  memcpy(cntrl_response, cntrl_response_header, CNTRL_RESP_HEADER_SIZE);
+  free(cntrl_response_header);  
+  memcpy(cntrl_response+CNTRL_RESP_HEADER_SIZE, cntrl_response_payload, payload_len);  
+  sendALL(sock_index, cntrl_response, response_len);
+  free(cntrl_response);
+}
+
+void Distance_Initialise()
+{
+  int i,j;
+  for(i=1;i<Number_of_routers+1;i++)
+  {
+    Distance_Vector[My_ID][i]=Routing_Table[i][3];
+    Distance_Vector[i][i]=0;
+  }
+  for(i=1;i<Number_of_routers+1;i++)
+  {
+    for(j=1;j<Number_of_routers+1;j++)
+    {
+      if(i!=My_ID && j!=i)
+        {
+          Distance_Vector[i][j]=65535;
+        }
+    }
+  }
+
+  //printf("Initial Distance vector : ");
+  for(i=1;i<Number_of_routers+1;i++)
+  {
+    for(j=1;j<Number_of_routers+1;j++)
+    {
+      //cout<<": "<<Distance_Vector[i][j];
+    } //cout<<endl;
+  } 
+}
+
+
+void NextHop()
+{
+  int i;
+  for(i=1;i<Number_of_routers+1;i++)
+  {
+    if(Routing_Table[i][3]==0)
+    {
+      Routing_Table[i][4]=Routing_Table[i][0];
+      My_ID=i;
+      ROUTER_PORT=Routing_Table[i][1];
+      DATA_PORT=Routing_Table[i][2];
+    } 
+    else if(Routing_Table[i][3]==65535)
+    {
+      Routing_Table[i][4]=65535;
+    }
+    else
+    {
+      Routing_Table[i][4]=Routing_Table[i][0];
+      Neighbors.push_back(Routing_Table[i][0]);
+    }
+  }
+
+  Distance_Initialise();
+  
+}
+
+/**Reference: http://www.geeksforgeeks.org/reverse-words-in-a-given-string/**/ 
+
+void Reverse(char *start, char *end)
+{
+  char temp;
+  while (start < end)
+  {
+    temp = *start;
+    *start++ = *end;
+    *end-- = temp;
+  }
+}
+
+void ReverseWords(char *s)
+{
+  char *start = s;
+  char *temp = s;
+
+  while( *temp )
+  {
+    temp++;
+    if (*temp == '\0')
+    {
+      Reverse(start, temp-1);
+    }
+    else if(*temp == '.')
+    {
+      Reverse(start, temp-1);
+      start = temp+1;
+    }
+  } 
+ 
+  Reverse(s, temp-1);
+}
+
+char* GetIPString(uint32_t x, int i) 
+{   
+    memset(buffer2, 0,sizeof(buffer2));
+    inet_ntop(AF_INET, &x, buffer2, sizeof(buffer2));
+    ReverseWords(buffer2);
+    strncpy(IP[i], buffer2, sizeof(buffer2));
+    return buffer2;
+}
+
+char* converto_IP(uint32_t x)
+{
+    memset(buffer2, 0,sizeof(buffer2));
+    inet_ntop(AF_INET, &x, buffer2, sizeof(buffer2));
+    ReverseWords(buffer2);
+    //cout<<"IP: "<<buffer2<<endl;
+}
+
+
+void get_Information(char *cntrl_payload)
+{
+    int i;
+    Number_of_routers=(uint16_t)((uint8_t)cntrl_payload[1] | (uint8_t)cntrl_payload[0]<<8);
+    Periodic_Interval=(uint16_t)((uint8_t)cntrl_payload[3] | (uint8_t)cntrl_payload[2]<<8);
+
+    for(i=0;i<Number_of_routers;i++)
+    {               
+          Routing_Table[i+1][0]=(uint16_t)((uint8_t)cntrl_payload[5+i*12] | (uint8_t)cntrl_payload[4+i*12]<<8);
+          Routing_Table[i+1][1]=(uint16_t)((uint8_t)cntrl_payload[7+i*12] | (uint8_t)cntrl_payload[6+i*12]<<8);
+          Routing_Table[i+1][2]=(uint16_t)((uint8_t)cntrl_payload[9+i*12] | (uint8_t)cntrl_payload[8+i*12]<<8);
+          Routing_Table[i+1][3]=(uint16_t)((uint8_t)cntrl_payload[11+i*12] | (uint8_t)cntrl_payload[10+i*12]<<8);
+          Initial_Cost[i+1]=Routing_Table[i+1][3];
+          Router_IP[i+1]=(uint32_t)((uint8_t)cntrl_payload[12+i*12] << 24 |(uint8_t)cntrl_payload[13+i*12] << 16 |  (uint8_t)cntrl_payload[14+i*12] << 8  |   (uint8_t)cntrl_payload[15+i*12]);
+          GetIPString(Router_IP[i+1],i+1);                            
+    } 
+    NextHop();
+}
+
+void getupdateTable()
+{
+    int i,j,count=0;
+    routing_update_payload=(char *)malloc(sizeof(uint16_t)*34);
+
+    uint16_t temp=htons(Number_of_routers);
+    memcpy(&routing_update_payload[count], &temp, 2);
+    count+=2;
+    
+    temp=htons(Routing_Table[My_ID][1]);
+    memcpy(&routing_update_payload[count], &temp, 2);
+    count+=2;    
+
+    uint32_t temp7 = htonl(Router_IP[My_ID]);
+    memcpy(&routing_update_payload[count], &temp7, 4);
+    count+=4;
+    
+    for(i=1;i<=Number_of_routers;i++)
+    {
+        uint32_t temp5= htonl(Router_IP[i]);
+        memcpy(&routing_update_payload[count], &temp5, 4);
+        count+=4;
+        
+        uint16_t temp=htons(Routing_Table[i][1]); 
+       // cout<<"Sending Data"<<Routing_Table[i][1]<<endl;
+        memcpy(&routing_update_payload[count], &temp, 2);
+        count+=2;
+
+        uint16_t temp4=0;
+        uint16_t temp3=htons(temp4);
+       // printf("Padding\n");
+        memcpy(&routing_update_payload[count], &temp3, 2);
+        count+=2;
+
+        temp=htons(Routing_Table[i][0]);
+  //  cout<<"Sending Data"<<Routing_Table[i][0]<<endl;
+        memcpy(&routing_update_payload[count], &temp, 2);
+        count+=2;   
+
+        temp=htons(Routing_Table[i][3]);
+  //  cout<<"Sending Data"<<Routing_Table[i][3]<<endl;
+        memcpy(&routing_update_payload[count], &temp, 2);
+        count+=2;        
+
+  }
+}
+
+void Print_DistanceVector()
+{
+  int i,j;
+  //printf("Printing distance vector\n");
+  for(i=1;i<Number_of_routers+1;i++)
+  {
+    for(j=1;j<Number_of_routers+1;j++)
+    {
+      //cout<<Distance_Vector[i][j]<<" ";
+    } //cout<<endl;
+  }
+}
+
+
+uint16_t getID(uint16_t num)
+{
+    int i;
+    for(i=1;i<Number_of_routers+1;i++)
+    {
+        if(num==Routing_Table[i][0])
+            return i;
+    }
+}
+
+uint16_t get_rID(uint16_t id)
+{
+  int i;
+  for(i=1;i<Number_of_routers+1;i++)
+  {
+    if(id==Routing_Table[i][0])
+      return i;
+  }
+}
+
+uint16_t get_rID_port(uint16_t port)
+{
+  int i;
+  for(i=1;i<Number_of_routers+1;i++)
+  {
+    if(port==Routing_Table[i][1])
+      return i;
+  }
+}
+
+void UDP_Send()
+{
+   int i;
+    
+   if(!Neighbors.empty())
+   {
+       int i;
+       for(i=0;i<Neighbors.size();i++)
+       {
+        
+        char *cntrl_response_payload;
+        routing_update_payload = (char *) malloc(sizeof(char)*1024);
+        uint16_t router_id_send=getID(Neighbors[i]);
+        //printf("sending data to neighbor with router id %d : %d, port number %d and IP %s\n",router_id_send, Routing_Table[router_id_send][0], Routing_Table[router_id_send][1], IP[router_id_send]);
+        getupdateTable();
+        struct sockaddr_in sendto_Addr;
+        int sock;    
+        sock = socket(AF_INET, SOCK_DGRAM, 0);
+        socklen_t addr_size;
+        sendto_Addr.sin_family = AF_INET;
+        sendto_Addr.sin_port = htons(Routing_Table[router_id_send][1]);
+        sendto_Addr.sin_addr.s_addr = inet_addr(IP[router_id_send]);  
+        addr_size = sizeof(sendto_Addr);
+        memset(&(sendto_Addr.sin_zero), '\0', sizeof(sendto_Addr.sin_zero)); 
+        int byt= (6*Number_of_routers) + 4;
+        sendto(sock, routing_update_payload, 2*byt, 0,(struct sockaddr *)&sendto_Addr,sizeof(struct sockaddr));
+        
+       }
+    }       
+   
+}
+
+void last_information(int sock_index)
+{
+  uint16_t payload_len, response_len;
+  char *cntrl_response_header, *cntrl_response_payload, *cntrl_response;
+
+  payload_len = 1036; // Discount the NULL chararcter
+  cntrl_response_payload = (char *) malloc(payload_len);
+  memcpy(cntrl_response_payload, last_packet_sent, payload_len);
+
+  cntrl_response_header = create_response_header(sock_index, 0, 0, payload_len);
+
+  response_len = CNTRL_RESP_HEADER_SIZE+payload_len;
+  cntrl_response = (char *) malloc(response_len);
+  /* Copy Header */
+  memcpy(cntrl_response, cntrl_response_header, CNTRL_RESP_HEADER_SIZE);
+  free(cntrl_response_header);
+  /* Copy Payload */
+  memcpy(cntrl_response+CNTRL_RESP_HEADER_SIZE, cntrl_response_payload, payload_len);
+  free(cntrl_response_payload);
+
+  sendALL(sock_index, cntrl_response, response_len);
+
+  free(cntrl_response);
+}
+
+void penultimate_information(int sock_index)
+{
+  uint16_t payload_len, response_len;
+  char *cntrl_response_header, *cntrl_response_payload, *cntrl_response;
+
+  payload_len = 1036; // Discount the NULL chararcter
+  cntrl_response_payload = (char *) malloc(payload_len);
+  memcpy(cntrl_response_payload, penultimate_packet, payload_len);
+
+  cntrl_response_header = create_response_header(sock_index, 0, 0, payload_len);
+
+  response_len = CNTRL_RESP_HEADER_SIZE+payload_len;
+  cntrl_response = (char *) malloc(response_len);
+  /* Copy Header */
+  memcpy(cntrl_response, cntrl_response_header, CNTRL_RESP_HEADER_SIZE);
+  free(cntrl_response_header);
+  /* Copy Payload */
+  memcpy(cntrl_response+CNTRL_RESP_HEADER_SIZE, cntrl_response_payload, payload_len);
+  free(cntrl_response_payload);
+
+  sendALL(sock_index, cntrl_response, response_len);
+
+  free(cntrl_response);
+}
+
+
+void getRoutingUpdateInfo(char* cntrl_payload)
+{
+    int i, routerid;
+    uint16_t Number_of_updates=(uint16_t)((uint8_t)cntrl_payload[1] | (uint8_t)cntrl_payload[0]<<8);
+    uint16_t Source_Port=(uint16_t)((uint8_t)cntrl_payload[3] | (uint8_t)cntrl_payload[2]<<8);
+    int r_id= get_rID_port(Source_Port);
+    //cout<<"Received data from router ID"<<r_id<<endl;
+    uint32_t Source_IP = (uint32_t)((uint8_t)cntrl_payload[7] |(uint8_t)cntrl_payload[6] << 8 |  (uint8_t)cntrl_payload[5] << 16  |   (uint8_t)cntrl_payload[4] <<24);
+    //converto_IP(Source_IP);
+    for(i=0;i<Number_of_updates;i++)
+    {               
+          uint32_t Router_uIP=(uint32_t)((uint8_t)cntrl_payload[11+i*12] |(uint8_t)cntrl_payload[10+i*12] << 8 |  (uint8_t)cntrl_payload[9+i*12] << 16  |   (uint8_t)cntrl_payload[8 +i*12] <<24);
+          //converto_IP(Router_uIP);
+          uint16_t Router_uPort = (uint16_t)((uint8_t)cntrl_payload[13+i*12] | (uint8_t)cntrl_payload[12+i*12]<<8);
+   //       cout<<"Router Port"<<Router_uPort<<" "<<endl;
+          uint16_t Padding_ubit =(uint16_t)((uint8_t)cntrl_payload[15+i*12] | (uint8_t)cntrl_payload[14+i*12]<<8);
+   //       cout<<"Padding_ubit"<<Padding_ubit<<" "<<endl;
+          uint16_t Router_uID = (uint16_t)((uint8_t)cntrl_payload[17+i*12] | (uint8_t)cntrl_payload[16+i*12]<<8); 
+   //       cout<<"Router_ID"<<Router_uID<<" ";
+          routerid=get_rID(Router_uID);
+   //       cout<<"ID matched to "<<routerid<<endl;
+          uint16_t Cost_u = (uint16_t)((uint8_t)cntrl_payload[19+i*12] | (uint8_t)cntrl_payload[18+i*12]<<8); 
+   //       cout<<"Cost"<<Cost_u<<" "<<endl;
+          Distance_Vector[r_id][routerid]=Cost_u;
+    }// cout<<" ----------------------------------------------------------------------------------- "<<endl;
+  //  Print_DistanceVector();    
+    dijkstra(r_id);
+}
+
+void get_link_update(char* cntrl_payload)
+{
+//printf("Getting update information \n");
+uint16_t router_in=(uint16_t)((uint8_t)cntrl_payload[1] | (uint8_t)cntrl_payload[0]<<8);
+uint16_t new_cost=(uint16_t)((uint8_t)cntrl_payload[3] | (uint8_t)cntrl_payload[2]<<8);
+uint16_t tempid=get_rID(router_in);
+if(Initial_Cost[tempid]==65535 && new_cost<65535)
+{
+  //printf("Updating neighbor list\n");
+  Neighbors.push_back(router_in);
+}
+Routing_Table[tempid][3]=new_cost;
+Routing_Table[tempid][4]=router_in;
+Distance_Vector[router_in][My_ID]=new_cost;
+dijkstra(tempid);
+}
+
+
+int get_id_from_ip(uint32_t num)
+{ //printf("GET ID CALLED\n");
+  int i;
+  for(i=1;i<Number_of_routers+1;i++)
+  { 
+    //printf("Inside if\n");
+    //cout<<"R_Table"<<Router_IP[i]<<"Num"<<num<<endl;
+    
+    if(num == Router_IP[i])
+    {
+      //printf("ID:%d", i);
+      return i;
+    }
+  }
+
+  return 0;
+}
+
+void send_TCP(int dest_id, int next_hop_id, uint8_t ttl, uint8_t Transfer_ID, uint16_t seq_num, int file_size, int socket_id)
+{ 
+  //printf("send_TCP called\n");
+
+  //printf("****HEADER****\n");
+
+  //cout<<"Dest ID: "<<dest_id<<" next_hop: "<<next_hop_id<<" ttl: "<<(int)ttl<<" Transfer_ID: "<<(int)Transfer_ID<<" Seq Num "<<seq_num<<endl;
+  
+  char file_buf[1024];
+  int count=0;
+  int num_of_segments=file_size/1024;
+  //printf("num_of_segments is: %d", num_of_segments);
+
+  if(dest_id!=My_ID)
+  {
+    FILE *fp;
+    fp = fopen(file_name, "rb");
+    if(fp == NULL)
+    {
+       // printf("Error opening file\n");
+        exit(1);
+    }
+
+    int sock;
+    //printf("Not my ID\n");
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in serv_addr;
+    memset(&serv_addr, '0', sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(Routing_Table[next_hop_id][2]);
+    inet_pton(AF_INET, IP[next_hop_id], &serv_addr.sin_addr);
+
+    if(connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) <0)
+    {
+     // printf("connection failed \n");
+            return;
+    }
+    ttl--;
+  for(int c=0;c<num_of_segments;c++)
+   { 
+   if(fread(file_buf, sizeof(file_buf[0]), 1024, fp) >0)  // && count<num_of_segments
+    {   int i;
+        uint16_t fin=0x0000;
+        uint16_t pad=0x0000;
+        uint32_t temp=htonl(Router_IP[dest_id]);
+        memcpy(&send_buffer[0], &temp, 4);
+        uint16_t comb=convert(Transfer_ID, ttl);
+        uint16_t temp8=htons(comb);
+        //printf("sending data %s\n",file_buf);
+        memcpy(&send_buffer[4],&temp8,2);
+        if(c==(num_of_segments-1))
+        {
+          fin=0x8000;
+        }
+       // cout<<"FIN:"<<fin<<endl;
+       // cout<<"Pad:"<<pad<<endl;
+        //cout<<"Sending Sequence number"<<seq_num<<endl;
+        uint16_t temp2=htons(seq_num);  ////////////////////here///////////////
+        memcpy(&send_buffer[6],&temp2,2);
+
+        uint16_t temp_f=htons(fin);
+        uint16_t temp_p=htons(pad);
+        memcpy(&send_buffer[8],&temp_f,2);
+        memcpy(&send_buffer[10],&temp_p,2);
+        //printf("sending: %s\n",file_buf);
+        memcpy(&send_buffer[12],&file_buf[0],1024);     
+        send(sock, send_buffer, 1036, 0);
+        sent++; 
+         if(sent>1)
+         {
+          memcpy(&penultimate_packet[0],&last_packet_sent[0],1036);
+         }
+         
+         memcpy(&last_packet_sent[0],&send_buffer[0],1036); 
+        memset(&file_buf,0,sizeof(file_buf));
+        memset(&send_buffer,0,sizeof(send_buffer));
+        count++;  
+        seq_num++;
+    }
+
+    if(c==(num_of_segments-1))
+        {
+          init_response(socket_id);
+        }
+  }
+
+    fclose(fp);
+  }
+    else if(dest_id==My_ID)
+    {
+      //printf("Destination Reached\n");
+    }
+}
+
+
+void get_file_information(char* cntrl_payload, int n, int socketid)
+{
+//printf("get file information called\n");
+int sizeof_filename=n-8;
+//printf("Size of the file is %d\n", n);
+uint32_t Destination_IP = (uint32_t)((uint8_t)cntrl_payload[3] |(uint8_t)cntrl_payload[2] << 8 |  (uint8_t)cntrl_payload[1] << 16  |   (uint8_t)cntrl_payload[0] <<24);
+//converto_IP(Destination_IP);
+int dest_id = get_id_from_ip(Destination_IP);
+uint8_t TTL=(uint8_t)(cntrl_payload[4]);
+//cout<<"TTL: "<<(int)TTL<<endl;
+uint8_t Transfer_ID=(uint8_t)(cntrl_payload[5]);
+//cout<<"ID: "<<(int)Transfer_ID<<endl;
+uint16_t SeqNo=(uint16_t)((uint8_t)cntrl_payload[7] | (uint8_t)cntrl_payload[6]<<8);
+memcpy(file_name,&cntrl_payload[8],sizeof_filename);
+int next_hop=Routing_Table[dest_id][4];
+int next_hop_id=get_rID(next_hop);
+int size=fileSize(file_name);
+//printf("size of file is %d\n", size);
+send_TCP(dest_id, next_hop_id, TTL, Transfer_ID, SeqNo, size, socketid);
+}
+
+void received_TCP()
+{ //printf("Received_TCP called\n");
+  uint32_t Destination_IP = (uint32_t)((uint8_t)TCP_payload[3] |(uint8_t)TCP_payload[2] << 8 |  (uint8_t)TCP_payload[1] << 16  |   (uint8_t)TCP_payload[0] <<24);
+  //converto_IP(Destination_IP);
+  //printf("PAcket to Destination %d\n", dest_id);
+
+  uint8_t transferid=(uint8_t)TCP_payload[4];
+  //cout<<"TID: "<<(int)transferid<<endl;
+
+  uint8_t ttl=(uint8_t)TCP_payload[5];
+  //cout<<"TTL "<<(int)ttl<<endl;
+
+  uint16_t seqno=(uint16_t)((uint8_t)TCP_payload[7] | (uint8_t)TCP_payload[6]<<8);  ///////////////here///////////////////
+  //cout<<"Sequence Num "<<seqno<<endl;
+
+  uint16_t fin=(uint16_t)((uint8_t)TCP_payload[9] | (uint8_t)TCP_payload[8]<<8);
+  //cout<<"Int Fin: "<<fin<<endl;
+  
+  if(fin==32768)
+  {
+    //printf("LAST SEGMENT\n");
+  }
+  else
+  {
+    //printf("more to come\n");
+  }
+
+  uint16_t pad=(uint16_t)((uint8_t)TCP_payload[11] | (uint8_t)TCP_payload[10]<<8);
+  //cout<<"Padding: "<<pad<<endl;
+
+  int dest_id = get_id_from_ip(Destination_IP);
+  //ttl--;
+
+  char fileopen[255]="file-";
+  if(dest_id==My_ID)
+  {
+    char data_final[1024],buffer_TCP[250];
+    //printf("Destination Reached\n");
+    memcpy(&data_final[0], &TCP_payload[12],1024);
+    ofstream file;
+    int tid=(int)transferid;
+    sprintf(buffer_TCP, "%d", tid);
+    memcpy(&fileopen[5],&buffer_TCP[0],sizeof(buffer_TCP));
+    //printf("The filename is %s\n",fileopen);
+    file.open(fileopen,std::ios_base::app);//std::ios_base::app
+    file << data_final;
+    //file.close();
+    return;
+  }
+  else if(ttl==1)
+  {
+    //printf("Packet will be dropped here\n");
+    return;
+  }
+  else
+  { ttl--;
+    char data_rcvd[1024];
+    char data_send[1036];
+    memcpy(&data_rcvd[0], &TCP_payload[12],1024);
+    //cout<<"Data is"<<data_rcvd<<endl;    
+    int next_hop=Routing_Table[dest_id][4];
+    int next_hop_id=get_rID(next_hop);
+    //send_TCP_fwd(dest_id, next_hop_id);
+
+    uint32_t temp=htonl(Destination_IP);
+    memcpy(&data_send[0],&temp,4);
+
+    uint16_t comb=convert(transferid, ttl);
+    uint16_t temp8=htons(comb);
+    memcpy(&data_send[4],&temp8,2);
+
+    uint16_t temp4=seqno;
+    memcpy(&data_send[6],&temp4,2);
+    uint16_t temp_z=htons(fin);
+    uint16_t temp_p=htons(pad);
+    memcpy(&data_send[8],&temp_z,2);
+    memcpy(&data_send[10],&temp_p,2);
+    memcpy(&data_send[12],&data_rcvd,1024);
+
+    //printf("Not my ID\n");
+    if(sock_tcp==-1)
+    {   sock_tcp = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in serv_addr;
+        memset(&serv_addr, '0', sizeof(serv_addr));
+        serv_addr.sin_family = AF_INET;
+        //serv_addr.sin_family = AF_INET;
+        //printf("Data to be sent on port\n");
+        serv_addr.sin_port = htons(Routing_Table[next_hop_id][2]);
+        inet_pton(AF_INET, IP[next_hop_id], &serv_addr.sin_addr);
+
+        if(connect(sock_tcp, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) <0)
+        {
+          //printf("connection failed \n");
+          //connected.push_back(sock);
+                return;
+        }
+        //sock_tcp=0;
+    }
+     send(sock_tcp, data_send, 1036, 0);   
+     sent++; 
+     if(sent>1)
+     {
+      memcpy(&penultimate_packet[0],&last_packet_sent[0],1036);
+     }
+     
+     memcpy(&last_packet_sent[0],&data_send[0],1036); 
+  }
+  
+}
